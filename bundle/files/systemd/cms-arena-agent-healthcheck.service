@@ -1,0 +1,8 @@
+[Unit]
+Description=Roll back a cms-arena-agent update that missed its health deadline
+ConditionPathExists=/opt/cms-arena-agent/state/pending.json
+ConditionPathExists=/opt/cms-arena-agent/previous
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cms-arena-agent/previous/cms-arena-agent healthcheck

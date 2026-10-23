@@ -1,0 +1,35 @@
+# Tag vX.Y.Z -> build the bundle -> create a DRAFT release, unsigned.
+# Signing happens on the owner's Mac with scripts/sign-release.sh, which also
+# publishes the release. CI never sees the signing key.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Refuse to build with the placeholder signing key
+        run: go run ./cmd/bundletool key-check
+      - run: ./scripts/build-release.sh "$GITHUB_REF_NAME"
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" --draft \
+            --title "cms-arena-agent $version" \
+            --notes "Unsigned draft. Sign and publish on the owner's Mac: scripts/sign-release.sh $GITHUB_REF_NAME" \
+            "dist/$version/manifest.json" \
+            "dist/$version/cms-arena-agent-$version.tar.gz"

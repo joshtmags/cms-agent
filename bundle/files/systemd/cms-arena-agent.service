@@ -1,0 +1,17 @@
+[Unit]
+Description=CMS arena display agent
+After=network-online.target
+Wants=network-online.target
+# Five crashes within five minutes means the binary is broken: hand over to
+# the previous version's rollback (it only acts if an update is pending).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=cms-arena-agent-rollback.service
+
+[Service]
+ExecStart=/opt/cms-arena-agent/current/cms-arena-agent run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

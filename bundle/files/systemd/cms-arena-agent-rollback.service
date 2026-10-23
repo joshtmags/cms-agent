@@ -1,0 +1,10 @@
+[Unit]
+Description=Roll back a cms-arena-agent update that keeps crashing
+ConditionPathExists=/opt/cms-arena-agent/previous
+
+[Service]
+Type=oneshot
+# Runs the previous release's binary, so it works even if the new one can't start.
+ExecStart=/opt/cms-arena-agent/previous/cms-arena-agent rollback --reason "crash loop after update"
+ExecStartPost=/bin/systemctl reset-failed cms-arena-agent.service
+ExecStartPost=/bin/systemctl start cms-arena-agent.service
