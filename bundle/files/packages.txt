@@ -1,0 +1,49 @@
+# Debian packages every display PC has. One list for both: provision.sh installs what's missing
+# (on every agent update), and the install USB (iso/) puts them all on the stick and installs them
+# offline. Installed without recommends. A package that isn't in Debian (tailscale) comes from its
+# own apt repo: the ISO adds it, cms-pc-setup installs it if missing.
+
+# kiosk: cage + Chromium on tty1, the device certificate in the browser
+cage
+chromium
+libnss3-tools
+openssl
+fonts-noto-core
+fonts-noto-color-emoji
+# hardware video decode on the Intel GPU, its firmware, CPU microcode
+intel-media-va-driver
+firmware-intel-graphics
+firmware-intel-misc
+firmware-misc-nonfree
+firmware-realtek
+intel-microcode
+# screenshots and screen modes under cage (the agent's commands)
+grim
+wlr-randr
+# the agent, updates, clock
+ca-certificates
+curl
+minisign
+unattended-upgrades
+systemd-timesyncd
+sudo
+# the TPM-held key and disk unlock (stage 6)
+tpm2-tools
+# remote support over Tailscale SSH
+htop
+btop
+tmux
+vim
+nano
+jq
+bind9-dnsutils
+mtr-tiny
+iperf3
+tcpdump
+ethtool
+lm-sensors
+smartmontools
+nvme-cli
+vainfo
+intel-gpu-tools
+rsync

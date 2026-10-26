@@ -11,7 +11,7 @@ import (
 	"github.com/joshtmags/cms-agent/internal/install"
 )
 
-// DefaultConfigPath is written by cms-arena-setup during enrollment.
+// DefaultConfigPath is written by cms-pc-setup during enrollment.
 const DefaultConfigPath = "/etc/cms-arena-agent/config.json"
 
 // Config is the agent's local configuration.

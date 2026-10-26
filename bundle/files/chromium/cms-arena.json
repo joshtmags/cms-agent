@@ -1,0 +1,22 @@
+{
+    "DeveloperToolsAvailability": 2,
+    "DownloadRestrictions": 3,
+    "PrintingEnabled": false,
+    "PasswordManagerEnabled": false,
+    "AutofillAddressEnabled": false,
+    "AutofillCreditCardEnabled": false,
+    "TranslateEnabled": false,
+    "BrowserSignin": 0,
+    "SyncDisabled": true,
+    "IncognitoModeAvailability": 1,
+    "BrowserGuestModeEnabled": false,
+    "BrowserAddPersonEnabled": false,
+    "DefaultBrowserSettingEnabled": false,
+    "MetricsReportingEnabled": false,
+    "AutoplayAllowed": true,
+    "AudioCaptureAllowed": false,
+    "VideoCaptureAllowed": false,
+    "ScreenCaptureAllowed": false,
+    "FileSelectionDialogsEnabled": false,
+    "HardwareAccelerationModeEnabled": true
+}

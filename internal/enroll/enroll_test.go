@@ -1,6 +1,7 @@
 package enroll
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +33,9 @@ type fakeCMS struct {
 	tamperFP bool
 	// wrongKey makes the CMS sign a different key than the one in the CSR.
 	wrongKey bool
+	// hold keeps the device waiting for approval; refuse answers the poll with 403 (revoked).
+	hold, refuse bool
+	begins       int // the code works once, like the real CMS
 }
 
 func newFakeCMS(t *testing.T) (*fakeCMS, *httptest.Server) {
@@ -47,16 +52,22 @@ func newFakeCMS(t *testing.T) (*fakeCMS, *httptest.Server) {
 	mux.HandleFunc("POST /device-api/enroll", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		json.NewDecoder(r.Body).Decode(&body)
-		if body["code"] != "ABCD-EFGH" {
+		if body["code"] != "ABCD-EFGH" || f.begins > 0 {
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]string{"message": "Unknown or expired enrollment code."})
 			return
 		}
+		f.begins++
 		json.NewEncoder(w).Encode(map[string]string{"device_uuid": "dev-1", "device_name": "TV 1", "token": "tok"})
 	})
 	mux.HandleFunc("POST /device-api/enroll/dev-1/csr", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		json.NewDecoder(r.Body).Decode(&body)
+		if f.csr != nil {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]string{"message": "This device already sent its certificate request."})
+			return
+		}
 		block, _ := pem.Decode([]byte(body["csr"]))
 		f.csr, _ = x509.ParseCertificateRequest(block.Bytes)
 		fp, _ := KeyFingerprint(f.csr.PublicKey)
@@ -66,11 +77,11 @@ func newFakeCMS(t *testing.T) (*fakeCMS, *httptest.Server) {
 		json.NewEncoder(w).Encode(map[string]string{"key_fingerprint": fp})
 	})
 	mux.HandleFunc("GET /device-api/enroll/dev-1", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer tok" {
+		if r.Header.Get("Authorization") != "Bearer tok" || f.refuse {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		if !f.approved {
+		if !f.approved || f.hold {
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
 			f.approved = true // approve on the second poll
@@ -100,6 +111,17 @@ func newFakeCMS(t *testing.T) (*fakeCMS, *httptest.Server) {
 func options(srv *httptest.Server, dir, code string) Options {
 	return Options{Server: srv.URL, Code: code, Dir: dir, Root: "/opt/cms-arena-agent",
 		PollInterval: time.Millisecond, Timeout: 5 * time.Second, HTTP: srv.Client()}
+}
+
+// interrupted runs an enrollment that stops while waiting for approval.
+func interrupted(t *testing.T, f *fakeCMS, o Options) {
+	t.Helper()
+	f.hold = true
+	o.Timeout = 20 * time.Millisecond
+	if err := Run(context.Background(), o); err == nil || !strings.Contains(err.Error(), "run enroll again") {
+		t.Fatalf("interrupted run: err = %v", err)
+	}
+	f.hold = false
 }
 
 func TestEnrollWritesKeyCertAndConfig(t *testing.T) {
@@ -153,5 +175,102 @@ func TestKeyFingerprintFormat(t *testing.T) {
 	fp, err := KeyFingerprint(key.Public())
 	if err != nil || len(fp) != 39 || strings.Count(fp, " ") != 7 || strings.ToUpper(fp) != fp {
 		t.Fatalf("fingerprint %q, %v", fp, err)
+	}
+}
+
+func TestEnrollResumesWithoutANewCode(t *testing.T) {
+	f, srv := newFakeCMS(t)
+	dir := t.TempDir()
+	interrupted(t, f, options(srv, dir, "ABCD-EFGH"))
+	if !InProgress(dir) || Enrolled(dir) {
+		t.Fatal("no enrollment in progress after the interruption")
+	}
+	sent, _ := KeyFingerprint(f.csr.PublicKey)
+
+	// Again without a code, and again with the same (now used) code: both resume.
+	for _, code := range []string{"", "abcd-efgh"} {
+		interrupted(t, f, options(srv, dir, code))
+	}
+	if err := Run(context.Background(), options(srv, dir, "")); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if f.begins != 1 {
+		t.Fatalf("used the code %d times", f.begins)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "device.key"))
+	block, _ := pem.Decode(data)
+	key, _ := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if fp, _ := KeyFingerprint(key.(*ecdsa.PrivateKey).Public()); fp != sent {
+		t.Fatalf("device.key %s is not the key the CMS saw (%s)", fp, sent)
+	}
+	if InProgress(dir) || !Enrolled(dir) {
+		t.Fatal("pending files left after approval")
+	}
+}
+
+func TestEnrollLeavesAnEnrolledPCAlone(t *testing.T) {
+	_, srv := newFakeCMS(t)
+	dir := t.TempDir()
+	if err := Run(context.Background(), options(srv, dir, "ABCD-EFGH")); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(dir, "device.key"))
+	err := Run(context.Background(), options(srv, dir, "ABCD-EFGH"))
+	if !errors.Is(err, ErrEnrolled) {
+		t.Fatalf("err = %v, want ErrEnrolled", err)
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, "device.key")); !bytes.Equal(before, after) {
+		t.Fatal("device.key changed")
+	}
+}
+
+func TestReenrollKeepsTheOldCertificateUntilApproved(t *testing.T) {
+	f, srv := newFakeCMS(t)
+	dir := t.TempDir()
+	if err := Run(context.Background(), options(srv, dir, "ABCD-EFGH")); err != nil {
+		t.Fatal(err)
+	}
+	oldKey, _ := os.ReadFile(filepath.Join(dir, "device.key"))
+	oldCert, _ := os.ReadFile(filepath.Join(dir, "device.crt"))
+
+	*f = fakeCMS{t: t, caKey: f.caKey, caCert: f.caCert, caPEM: f.caPEM} // a new code for the same device
+	o := options(srv, dir, "ABCD-EFGH")
+	o.Force = true
+	interrupted(t, f, o)
+	if k, _ := os.ReadFile(filepath.Join(dir, "device.key")); !bytes.Equal(k, oldKey) {
+		t.Fatal("the working key was replaced before approval")
+	}
+	if err := Run(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := os.ReadFile(filepath.Join(dir, "device.crt")); bytes.Equal(c, oldCert) {
+		t.Fatal("certificate not replaced after approval")
+	}
+}
+
+func TestEnrollDropsARefusedEnrollment(t *testing.T) {
+	f, srv := newFakeCMS(t)
+	dir := t.TempDir()
+	interrupted(t, f, options(srv, dir, "ABCD-EFGH"))
+	f.refuse = true // revoked, or a new code issued meanwhile
+	err := Run(context.Background(), options(srv, dir, ""))
+	if err == nil || !strings.Contains(err.Error(), "issue a new code") {
+		t.Fatalf("err = %v", err)
+	}
+	if InProgress(dir) {
+		t.Fatal("kept an enrollment the CMS refused")
+	}
+}
+
+func TestEnrollWithANewCodeStartsOver(t *testing.T) {
+	f, srv := newFakeCMS(t)
+	dir := t.TempDir()
+	interrupted(t, f, options(srv, dir, "ABCD-EFGH"))
+	err := Run(context.Background(), options(srv, dir, "WRON-GCOD"))
+	if err == nil || !strings.Contains(err.Error(), "Unknown or expired") {
+		t.Fatalf("err = %v", err)
+	}
+	if InProgress(dir) {
+		t.Fatal("kept the old enrollment after a different code")
 	}
 }

@@ -1,0 +1,78 @@
+#!/bin/sh
+# Puts this PC's device certificate (from enrollment) into the kiosk browser and tells Chromium to
+# use it for the display host without asking. Run as root after enrolling or re-enrolling
+# (`cms-arena-agent enroll` and cms-pc-setup do).
+#
+# Safe to run again: when the browser already has this certificate and policy it changes nothing
+# and leaves the kiosk running. Only a change restarts the kiosk (the screen blanks for a moment).
+#
+# Until the key lives in the TPM, the kiosk user's NSS database holds a copy of the private key:
+# protect the PC (locked BIOS, no keyboard, revoke a lost PC in the CMS).
+set -eu
+
+dir=/etc/cms-arena-agent
+config="$dir/config.json"
+nssdb=/home/kiosk/.pki/nssdb
+nickname=cms-arena-device
+policy=/etc/chromium/policies/managed/cms-arena-certificate.json
+
+for f in "$config" "$dir/device.crt" "$dir/device.key"; do
+    [ -f "$f" ] || { echo "cms-arena-kiosk-cert: $f missing: enroll first" >&2; exit 1; }
+done
+display_url="$(sed -n 's/^[[:space:]]*"cms_url":[[:space:]]*"\([^"]*\)".*/\1/p' "$config")"
+host="$(printf '%s' "$display_url" | sed -E 's#^https?://##; s#[:/].*$##')"
+[ -n "$host" ] || { echo "cms-arena-kiosk-cert: no cms_url in $config" >&2; exit 1; }
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+changed=""
+
+# The kiosk user's NSS database, holding only the current certificate. Built next to the old one
+# and swapped in, so a failure halfway leaves the old one working.
+want="$(openssl x509 -in "$dir/device.crt" -noout -fingerprint -sha256)"
+have="$(runuser -u kiosk -- certutil -L -d "sql:$nssdb" -n "$nickname" -a 2>/dev/null |
+    openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
+if [ "$want" != "$have" ]; then
+    openssl pkcs12 -export -in "$dir/device.crt" -inkey "$dir/device.key" -name "$nickname" \
+        -passout pass: -out "$work/device.p12"
+    chmod 0600 "$work/device.p12"
+    chown kiosk "$work" "$work/device.p12"
+    install -d -m 0700 -o kiosk -g kiosk /home/kiosk/.pki
+    rm -rf "$nssdb.new"
+    install -d -m 0700 -o kiosk -g kiosk "$nssdb.new"
+    runuser -u kiosk -- certutil -N -d "sql:$nssdb.new" --empty-password
+    runuser -u kiosk -- pk12util -i "$work/device.p12" -d "sql:$nssdb.new" -W "" >/dev/null
+    rm -rf "$nssdb.old"
+    [ ! -d "$nssdb" ] || mv "$nssdb" "$nssdb.old"
+    mv "$nssdb.new" "$nssdb"
+    rm -rf "$nssdb.old"
+    changed=1
+    echo "cms-arena-kiosk-cert: device certificate installed in the kiosk browser"
+fi
+
+# Pick that certificate for the display host, never ask.
+cat > "$work/policy.json" <<JSON
+{
+    "AutoSelectCertificateForUrls": ["{\"pattern\":\"https://${host}\",\"filter\":{}}"]
+}
+JSON
+if ! cmp -s "$work/policy.json" "$policy"; then
+    install -D -m 0644 "$work/policy.json" "$policy"
+    changed=1
+    echo "cms-arena-kiosk-cert: browser set to use it for https://${host}"
+fi
+
+# The display address for the kiosk browser. The browser runs as user kiosk and can't read
+# $dir (root-only: it holds the key); systemd reads this file as root for cms-arena-kiosk.service.
+printf 'CMS_DISPLAY_URL=%s\n' "${display_url%/}" >"$work/kiosk.env"
+if ! cmp -s "$work/kiosk.env" "$dir/kiosk.env"; then
+    install -m 0600 "$work/kiosk.env" "$dir/kiosk.env"
+    changed=1
+    echo "cms-arena-kiosk-cert: kiosk set to open ${display_url%/}/display"
+fi
+
+if [ -z "$changed" ]; then
+    echo "cms-arena-kiosk-cert: the kiosk browser already has this certificate for https://${host}"
+elif systemctl is-enabled --quiet cms-arena-kiosk.service 2>/dev/null; then
+    systemctl restart cms-arena-kiosk.service
+fi

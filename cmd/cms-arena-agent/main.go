@@ -1,6 +1,6 @@
 // Command cms-arena-agent runs on each arena display PC.
 //
-//	cms-arena-agent enroll --server URL --code XXXX-XXXX   get this PC's certificate (once, at setup)
+//	cms-arena-agent enroll --server URL --code XXXX-XXXX   get this PC's certificate (once, at setup; run again to resume)
 //	cms-arena-agent run                      poll the CMS, report status, pull signed updates (systemd)
 //	cms-arena-agent version                  print the version
 //	cms-arena-agent verify --dir DIR         verify a downloaded release exactly as a PC would
@@ -71,15 +71,29 @@ func usage() {
 func enrollCmd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	server := fs.String("server", "", "the CMS, e.g. https://cms.example.com (the normal host, not the display host)")
-	code := fs.String("code", "", "one-time enrollment code from the CMS")
+	code := fs.String("code", "", "one-time enrollment code from the CMS (not needed to resume an enrollment in progress)")
 	dir := fs.String("dir", filepath.Dir(agent.DefaultConfigPath), "where the key, certificate and config go")
 	root := fs.String("root", install.DefaultRoot, "install root written into config.json")
+	force := fs.Bool("force", false, "enroll again although this PC is enrolled (the old certificate stays until the new one is approved)")
 	fs.Parse(args)
-	if *server == "" || *code == "" {
-		return errors.New("--server and --code are required")
+	if *server == "" {
+		return errors.New("--server is required")
 	}
-	return enroll.Run(ctx, enroll.Options{Server: *server, Code: *code, Dir: *dir, Root: *root, Out: os.Stdout})
+	if err := enroll.Run(ctx, enroll.Options{Server: *server, Code: *code, Dir: *dir, Root: *root, Force: *force, Out: os.Stdout}); err != nil {
+		return err
+	}
+	// The kiosk browser needs the new certificate too (installed by provision.sh on a display PC).
+	if _, err := os.Stat(kioskCertHelper); err == nil {
+		cmd := exec.Command(kioskCertHelper)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("enrolled, but %s failed: %w (run it again)", kioskCertHelper, err)
+		}
+	}
+	return nil
 }
+
+const kioskCertHelper = "/usr/local/bin/cms-arena-kiosk-cert"
 
 func run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)

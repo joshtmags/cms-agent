@@ -1,0 +1,27 @@
+#!/bin/sh
+# The kiosk's browser: Chromium full screen under cage (cms-arena-kiosk.service, user kiosk).
+# It opens the local start page, which waits until the display host answers and then goes to
+# /display. The client certificate comes from the kiosk user's NSS database (cms-arena-kiosk-cert)
+# and is picked automatically by the managed policy, so no dialog ever shows.
+set -eu
+
+# From /etc/cms-arena-agent/kiosk.env (the unit's EnvironmentFile): this user can't read the
+# agent's config. Empty until enrolled: the start page then says "Not set up yet".
+display_url="${CMS_DISPLAY_URL:-}"
+start="file:///opt/cms-arena-agent/current/files/splash/index.html"
+if [ -n "$display_url" ]; then
+    start="${start}?target=${display_url%/}/display"
+fi
+
+exec chromium \
+    --kiosk \
+    --start-fullscreen \
+    --ozone-platform=wayland \
+    --noerrdialogs \
+    --disable-infobars \
+    --no-first-run \
+    --disable-session-crashed-bubble \
+    --disable-features=TranslateUI \
+    --autoplay-policy=no-user-gesture-required \
+    --check-for-update-interval=31536000 \
+    "$start"

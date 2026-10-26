@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- The kiosk's start page, served from the PC itself (cms-arena-kiosk-browser). Shown until the
+     display host answers, e.g. when the PC boots before the arena's internet is up; then it goes
+     to /display. Never a browser error page. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Display</title>
+<style>
+    html, body { margin: 0; height: 100%; background: #000; color: #fff; cursor: none;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+    .chip { display: flex; align-items: center; gap: 8px; padding: 8px 18px; border-radius: 999px;
+        background: rgba(180, 30, 30, .9); font-weight: 700; animation: pulse 1.6s ease-in-out infinite; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #fff; }
+    p { opacity: .5; margin: 0; font-size: 14px; }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.96); } }
+</style>
+</head>
+<body>
+<main>
+    <div class="chip"><span class="dot"></span><span id="state">Connecting…</span></div>
+    <p id="detail"></p>
+</main>
+<script>
+    const target = new URLSearchParams(location.search).get("target");
+    const detail = document.getElementById("detail");
+    if (!target) {
+        document.getElementById("state").textContent = "Not set up yet";
+        detail.textContent = "Run cms-pc-setup on this PC.";
+    } else {
+        // Any answer from the display host (even an error status) means it's reachable;
+        // a network failure means not yet.
+        const tryIt = () =>
+            fetch(target, { mode: "no-cors", cache: "no-store" })
+                .then(() => location.replace(target))
+                .catch(() => { detail.textContent = "Waiting for " + new URL(target).host; setTimeout(tryIt, 3000); });
+        tryIt();
+    }
+</script>
+</body>
+</html>

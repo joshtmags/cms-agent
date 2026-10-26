@@ -4,7 +4,7 @@ The agent (`cms-arena-agent`) that runs on each arena display PC (Intel N150, De
 
 The full design (certificates, display page, stream lock-down, power, install USB) lives in the cms repo: `docs/arena-display-devices.md`. This repo implements its device side.
 
-**Status:** done and tested end to end against the local CMS: enrollment (one-time code, key generated on the PC, CMS-signed certificate, revoke and re-enroll) and the signed update pipeline (build, sign, verify, install, health check, rollback). Still to come: the TPM-held key and `cms-arena-setup`, the kiosk and splash page in `provision.sh`, display commands (reload/reboot/shutdown/screenshot), and the install USB build. These need the Phase 0 hardware.
+**Status:** done and tested end to end against the local CMS: enrollment (one-time code, key generated on the PC, CMS-signed certificate, revoke and re-enroll, resume after an interruption), the signed update pipeline (build, sign, verify, install, health check, rollback) and display commands. Since 1.1.0: `cms-pc-setup` (one-shot setup, safe to rerun), the kiosk (cage + Chromium) and start page in `provision.sh`, and the install USB (`iso/`, `docs/INSTALL-USB.md`), tested in a UEFI VM. Still to come: the TPM-held key and disk encryption, certificate renewal, and the first test on the N100/N150 hardware.
 
 ## How an update gets from your Mac to every PC
 

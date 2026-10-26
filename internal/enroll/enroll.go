@@ -7,6 +7,12 @@
 //  5. GET  {server}/device-api/enroll/{uuid} until approved -> certificate, CA certificate, display URL
 //  6. write device.key, device.crt, ca.crt and config.json
 //
+// Safe to run again. The code works once, so after step 1 the uuid, token and new key are kept in
+// enroll-pending.json / enroll-pending.key: running enroll again (after Ctrl-C, a power cut, a lost
+// SSH session) resumes waiting with the same key and fingerprint instead of needing a new code. A PC
+// that is already enrolled is left alone unless Force is set, and even then its working certificate
+// stays in place until the new one is approved.
+//
 // Phase 0 moves the key into the TPM; for now it is a root-only file.
 package enroll
 
@@ -36,13 +42,48 @@ import (
 // Options configures one enrollment.
 type Options struct {
 	Server       string // the normal CMS host, e.g. https://cms.example.com
-	Code         string
+	Code         string // may be empty when resuming an enrollment in progress
 	Dir          string // where device.key, device.crt, ca.crt and config.json go
 	Root         string // the agent's install root, written into config.json
+	Force        bool   // enroll again although this PC already has a certificate
 	PollInterval time.Duration
 	Timeout      time.Duration
 	HTTP         *http.Client
 	Out          io.Writer
+}
+
+// ErrEnrolled: the PC already has a certificate and config, and Force isn't set.
+var ErrEnrolled = errors.New("this PC is already enrolled")
+
+const (
+	pendingFile    = "enroll-pending.json"
+	pendingKeyFile = "enroll-pending.key"
+)
+
+// pending is an enrollment that has used its code but isn't approved yet.
+type pending struct {
+	Server     string `json:"server"`
+	CodeHash   string `json:"code_hash"`
+	DeviceUUID string `json:"device_uuid"`
+	DeviceName string `json:"device_name"`
+	Token      string `json:"token"`
+	CSRSent    bool   `json:"csr_sent"`
+}
+
+// Enrolled reports whether dir holds a finished enrollment (config, certificate and key).
+func Enrolled(dir string) bool {
+	for _, name := range []string{"config.json", "device.crt", "device.key"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// InProgress reports whether dir holds an enrollment that can be resumed without a code.
+func InProgress(dir string) bool {
+	p, _, err := loadPending(dir)
+	return err == nil && p != nil
 }
 
 // Run enrolls the device and writes its files. It returns once the admin has
@@ -64,53 +105,65 @@ func Run(ctx context.Context, o Options) error {
 	if !strings.HasPrefix(server, "https://") {
 		return errors.New("--server must be an https URL")
 	}
+	if Enrolled(o.Dir) && !o.Force {
+		return fmt.Errorf("%w (%s); to enroll again: revoke it in the CMS, issue a new code, run enroll with --force", ErrEnrolled, o.Dir)
+	}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		return err
 	}
 
-	var begun struct {
-		DeviceUUID string `json:"device_uuid"`
-		DeviceName string `json:"device_name"`
-		Token      string `json:"token"`
-	}
-	if _, err := call(ctx, o.HTTP, http.MethodPost, server+"/device-api/enroll", "", map[string]string{"code": o.Code}, &begun); err != nil {
-		return fmt.Errorf("enrollment code: %w", err)
-	}
-	fmt.Fprintf(o.Out, "Enrolling as %q (%s)\n", begun.DeviceName, begun.DeviceUUID)
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	p, key, err := loadPending(o.Dir)
 	if err != nil {
 		return err
 	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return err
+	// A new code, or another CMS, starts over; the same code (or none) resumes.
+	if p != nil && (p.Server != server || (o.Code != "" && p.CodeHash != hashCode(o.Code))) {
+		removePending(o.Dir)
+		p, key = nil, nil
 	}
-	keyPath := filepath.Join(o.Dir, "device.key")
-	if err := writeFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		return err
-	}
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: begun.DeviceUUID},
-	}, key)
-	if err != nil {
-		return err
+	if p == nil {
+		if o.Code == "" {
+			return errors.New("--code is required (no enrollment in progress to resume)")
+		}
+		if p, key, err = begin(ctx, o, server); err != nil {
+			return err
+		}
+		fmt.Fprintf(o.Out, "Enrolling as %q (%s)\n", p.DeviceName, p.DeviceUUID)
+	} else {
+		fmt.Fprintf(o.Out, "Resuming the enrollment in progress as %q (%s)\n", p.DeviceName, p.DeviceUUID)
 	}
 	localFP, err := KeyFingerprint(key.Public())
 	if err != nil {
 		return err
 	}
 
-	var submitted struct {
-		KeyFingerprint string `json:"key_fingerprint"`
-	}
-	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
-	if _, err := call(ctx, o.HTTP, http.MethodPost, server+"/device-api/enroll/"+begun.DeviceUUID+"/csr", begun.Token,
-		map[string]string{"csr": string(csrPEM)}, &submitted); err != nil {
-		return fmt.Errorf("certificate request: %w", err)
-	}
-	if submitted.KeyFingerprint != localFP {
-		return fmt.Errorf("the CMS saw key %s but this PC has %s: something is in between, stopping", submitted.KeyFingerprint, localFP)
+	if !p.CSRSent {
+		csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+			Subject: pkix.Name{CommonName: p.DeviceUUID},
+		}, key)
+		if err != nil {
+			return err
+		}
+		var submitted struct {
+			KeyFingerprint string `json:"key_fingerprint"`
+		}
+		csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+		status, err := call(ctx, o.HTTP, http.MethodPost, server+"/device-api/enroll/"+p.DeviceUUID+"/csr", p.Token,
+			map[string]string{"csr": string(csrPEM)}, &submitted)
+		switch {
+		case err == nil && submitted.KeyFingerprint != localFP:
+			removePending(o.Dir)
+			return fmt.Errorf("the CMS saw key %s but this PC has %s: something is in between, stopping", submitted.KeyFingerprint, localFP)
+		case err == nil, status == http.StatusUnprocessableEntity && strings.Contains(err.Error(), "already sent"):
+			// Sent now, or by an earlier run that stopped before it could note it. The
+			// certificate is checked against this key below either way.
+			p.CSRSent = true
+			if err := savePending(o.Dir, p, nil); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("certificate request: %w", abandonIfRefused(o.Dir, status, err))
+		}
 	}
 	fmt.Fprintf(o.Out, "\n  Key fingerprint:  %s\n\n  Approve this device in the CMS only if it shows the same fingerprint.\n  Waiting for approval...\n", localFP)
 
@@ -122,33 +175,38 @@ func Run(ctx context.Context, o Options) error {
 	}
 	deadline := time.Now().Add(o.Timeout)
 	for {
-		status, err := call(ctx, o.HTTP, http.MethodGet, server+"/device-api/enroll/"+begun.DeviceUUID, begun.Token, nil, &approved)
-		if err != nil {
-			return fmt.Errorf("waiting for approval: %w", err)
+		status, err := call(ctx, o.HTTP, http.MethodGet, server+"/device-api/enroll/"+p.DeviceUUID, p.Token, nil, &approved)
+		if err != nil && status/100 == 4 {
+			return fmt.Errorf("waiting for approval: %w", abandonIfRefused(o.Dir, status, err))
 		}
-		if status == http.StatusOK && approved.Status == "approved" {
+		if err != nil {
+			// Network or server trouble: keep waiting, the enrollment is still valid.
+			fmt.Fprintf(o.Out, "  (can't reach the CMS right now: %v; still waiting)\n", err)
+		} else if status == http.StatusOK && approved.Status == "approved" {
 			break
 		}
 		if time.Now().After(deadline) {
-			return errors.New("not approved in time; issue a new code and run enroll again")
+			return errors.New("not approved yet; run enroll again to keep waiting (no new code needed)")
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("%w; run enroll again to keep waiting (no new code needed)", ctx.Err())
 		case <-time.After(o.PollInterval):
 		}
 	}
-	if err := checkCertificate(approved.Certificate, key, begun.DeviceUUID); err != nil {
+	if err := checkCertificate(approved.Certificate, key, p.DeviceUUID); err != nil {
+		removePending(o.Dir)
 		return err
 	}
 
+	// The pending files go last: if this stops halfway, running enroll again fetches the same
+	// certificate and writes everything again.
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return err
+	}
+	keyPath := filepath.Join(o.Dir, "device.key")
 	certPath := filepath.Join(o.Dir, "device.crt")
-	if err := writeFile(certPath, []byte(approved.Certificate), 0o644); err != nil {
-		return err
-	}
-	if err := writeFile(filepath.Join(o.Dir, "ca.crt"), []byte(approved.CACertificate), 0o644); err != nil {
-		return err
-	}
 	config, err := json.MarshalIndent(map[string]any{
 		"cms_url":   approved.DisplayURL,
 		"cert_file": certPath,
@@ -158,11 +216,121 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return err
 	}
-	if err := writeFile(filepath.Join(o.Dir, "config.json"), append(config, '\n'), 0o644); err != nil {
-		return err
+	for _, f := range []struct {
+		path string
+		data []byte
+		mode os.FileMode
+	}{
+		{filepath.Join(o.Dir, "ca.crt"), []byte(approved.CACertificate), 0o644},
+		{keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600},
+		{certPath, []byte(approved.Certificate), 0o644},
+		{filepath.Join(o.Dir, "config.json"), append(config, '\n'), 0o644},
+	} {
+		if err := writeFile(f.path, f.data, f.mode); err != nil {
+			return err
+		}
 	}
+	removePending(o.Dir)
 	fmt.Fprintf(o.Out, "Approved. Certificate and config written to %s; display host %s\n", o.Dir, approved.DisplayURL)
 	return nil
+}
+
+// begin trades the code for a uuid and polling token and makes the key. Both are saved before
+// anything else is sent, so the code isn't lost if the run stops here.
+func begin(ctx context.Context, o Options, server string) (*pending, *ecdsa.PrivateKey, error) {
+	var begun struct {
+		DeviceUUID string `json:"device_uuid"`
+		DeviceName string `json:"device_name"`
+		Token      string `json:"token"`
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := call(ctx, o.HTTP, http.MethodPost, server+"/device-api/enroll", "", map[string]string{"code": o.Code}, &begun); err != nil {
+		return nil, nil, fmt.Errorf("enrollment code: %w", err)
+	}
+	p := &pending{Server: server, CodeHash: hashCode(o.Code), DeviceUUID: begun.DeviceUUID, DeviceName: begun.DeviceName, Token: begun.Token}
+	if err := savePending(o.Dir, p, key); err != nil {
+		return nil, nil, err
+	}
+	return p, key, nil
+}
+
+// abandonIfRefused drops the enrollment in progress when the CMS refused it for good (revoked, a
+// new code issued, unknown device): resuming can't work, only a new code can.
+func abandonIfRefused(dir string, status int, err error) error {
+	if status/100 != 4 {
+		return err
+	}
+	removePending(dir)
+	return fmt.Errorf("%w; the CMS no longer accepts this enrollment: issue a new code and run enroll again", err)
+}
+
+func loadPending(dir string) (*pending, *ecdsa.PrivateKey, error) {
+	data, err := os.ReadFile(filepath.Join(dir, pendingFile))
+	if os.IsNotExist(err) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var p pending
+	keyPEM, keyErr := os.ReadFile(filepath.Join(dir, pendingKeyFile))
+	if json.Unmarshal(data, &p) != nil || keyErr != nil {
+		removePending(dir) // unreadable: start over with a code
+		return nil, nil, nil
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		removePending(dir)
+		return nil, nil, nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	key, ok := parsed.(*ecdsa.PrivateKey)
+	if err != nil || !ok {
+		removePending(dir)
+		return nil, nil, nil
+	}
+	return &p, key, nil
+}
+
+// savePending writes the state, and the key when given (it only changes in begin).
+func savePending(dir string, p *pending, key *ecdsa.PrivateKey) error {
+	if key != nil {
+		der, err := x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			return err
+		}
+		if err := writeFile(filepath.Join(dir, pendingKeyFile), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+			return err
+		}
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return writeFile(filepath.Join(dir, pendingFile), data, 0o600) // holds the polling token
+}
+
+func removePending(dir string) {
+	os.Remove(filepath.Join(dir, pendingFile))
+	os.Remove(filepath.Join(dir, pendingKeyFile))
+}
+
+// hashCode identifies the code an enrollment started with without keeping the code itself.
+func hashCode(code string) string {
+	norm := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r - 'a' + 'A'
+		case (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			return r
+		}
+		return -1
+	}, code)
+	sum := sha256.Sum256([]byte(norm))
+	return hex.EncodeToString(sum[:])
 }
 
 // KeyFingerprint is SHA-256 of the DER public key, first 16 bytes as

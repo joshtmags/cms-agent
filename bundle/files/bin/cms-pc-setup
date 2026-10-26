@@ -1,0 +1,322 @@
+#!/bin/bash
+# Setup of an arena display PC (Debian stable), run as root from a signed release:
+#
+#   curl the release's three files, verify manifest.json with minisign and the public key
+#   (docs/PC-SETUP.md), tar -xzf cms-arena-agent-<v>.tar.gz, then:
+#   sudo ./files/bin/cms-pc-setup --server https://cms.example.com --code XXXX-XXXX
+#
+# Afterwards it's installed as /usr/local/sbin/cms-pc-setup: run again, it's just `sudo cms-pc-setup`.
+#
+# Steps: checks → security updates → install the agent (apply: verifies the release again, runs
+# provision.sh: packages, kiosk, lockdown) → name → Tailscale → enroll (wait for Approve in the
+# CMS) → the certificate into the kiosk browser, start → verify.
+#
+# Safe to run again, on purpose or by accident, also on a PC that's showing a live event: every
+# step checks first and skips what's done, and nothing that is working gets restarted. A run that
+# stopped halfway (Ctrl-C, power cut, lost SSH) continues where it was, including an enrollment
+# waiting for approval (no new code needed). What it remembers (CMS address, name) is in
+# /etc/cms-arena-agent/setup.conf, so a second run needs no options.
+set -euo pipefail
+
+AGENT_ROOT=/opt/cms-arena-agent
+CONFIG_DIR=/etc/cms-arena-agent
+STATE="$CONFIG_DIR/setup.conf"
+# The release directory: the unpacked download on a first run; the installed release when run
+# again as /usr/local/sbin/cms-pc-setup (provision.sh puts it there).
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ ! -x "$here/cms-arena-agent" ] && [ -e "$AGENT_ROOT/current" ]; then
+    here="$(readlink -f "$AGENT_ROOT/current")"
+fi
+
+server="" code="" hostname="" tailscale=1 upgrade=""
+usage() {
+    cat <<USAGE
+usage: sudo $0 --server https://<cms domain> --code XXXX-XXXX [options]
+  --server URL        the CMS (its normal domain, not the display host); remembered
+  --code CODE         the one-time enrollment code from Backstage Management → Display Devices
+                      (only for the first enrollment; a run that stopped while waiting resumes without it)
+  --hostname NAME     the PC's name, also on the tailnet (default: arena-<code's first 4 characters>); remembered
+  --no-tailscale      skip joining Tailscale (remote support)
+  --no-upgrade        skip installing pending security updates
+  --upgrade           install pending updates although the PC is already set up (not during an event)
+Running it again on a set-up PC only checks and repairs.
+USAGE
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --server) server="${2:-}"; shift 2 ;;
+        --code) code="${2:-}"; shift 2 ;;
+        --hostname) hostname="${2:-}"; shift 2 ;;
+        --no-tailscale) tailscale=0; shift ;;
+        --no-upgrade) upgrade=0; shift ;;
+        --upgrade) upgrade=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+step() { current_step="$*"; printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok() { printf '   \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '   \033[33m!\033[0m %s\n' "$*"; }
+die() { printf '   \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+current_step=""
+on_exit() {
+    local status=$?
+    if [ "$status" -ne 0 ] && [ -n "$current_step" ]; then
+        printf '\n\033[31mStopped at: %s\033[0m\nFix the cause and run the same command again: it continues from here, nothing needs undoing.\n' \
+            "$current_step" >&2
+    fi
+}
+trap on_exit EXIT
+
+# remember KEY VALUE: keeps what a second run needs in $STATE.
+remember() {
+    install -d -m 0700 "$CONFIG_DIR"
+    touch "$STATE" && chmod 0600 "$STATE"
+    sed -i "/^$1=/d" "$STATE"
+    printf '%s=%q\n' "$1" "$2" >>"$STATE"
+}
+
+enrolled() {
+    [ -f "$CONFIG_DIR/config.json" ] && [ -f "$CONFIG_DIR/device.crt" ] && [ -f "$CONFIG_DIR/device.key" ]
+}
+
+# --- 1. checks ----------------------------------------------------------------------------
+step "1/9 Checks"
+[ "$(id -u)" -eq 0 ] || die "run as root: sudo $0 …"
+# shellcheck source=/dev/null
+. /etc/os-release
+[ "${ID:-}" = debian ] || die "this is ${PRETTY_NAME:-not Debian}: display PCs run Debian stable"
+[ "$(dpkg --print-architecture)" = amd64 ] || die "the agent is built for amd64"
+[ -x "$here/cms-arena-agent" ] && [ -f "$here/provision.sh" ] || die "run this from an unpacked release (cms-arena-agent and provision.sh next to files/)"
+
+# One run at a time (a second terminal, or a run left going in a lost SSH session).
+exec 9>/run/cms-pc-setup.lock
+flock -n 9 || die "cms-pc-setup is already running on this PC (another terminal or SSH session)"
+
+SETUP_SERVER="" SETUP_HOSTNAME="" SETUP_DONE=""
+# shellcheck source=/dev/null # written by remember() above, root-only
+[ -f "$STATE" ] && . "$STATE"
+if [ -n "$SETUP_DONE" ]; then
+    ok "this PC was set up on $SETUP_DONE: this run only checks and repairs; nothing that works is restarted"
+fi
+
+if [ -n "$server" ] && [ -n "$SETUP_SERVER" ] && [ "${server%/}" != "$SETUP_SERVER" ] && enrolled; then
+    die "this PC is enrolled with $SETUP_SERVER, not $server: to move it, revoke it there, then see docs/PC-SETUP.md (re-enrolling)"
+fi
+server="${server:-$SETUP_SERVER}"
+needs_code=""
+enrolled || [ -f "$CONFIG_DIR/enroll-pending.json" ] || needs_code=1
+# An enrolled PC doesn't need the address any more (the display host is in its config).
+[ -n "$server" ] || enrolled || read -r -p "   CMS address (https://…): " server
+[ -z "$needs_code" ] || [ -n "$code" ] || read -r -p "   Enrollment code (XXXX-XXXX): " code
+server="${server%/}"
+if enrolled; then
+    ok "Debian ${VERSION_ID:-?} amd64, enrolled${server:+ with $server}"
+else
+    [[ "$server" == https://* ]] || die "--server must start with https://"
+    curl -fsS -o /dev/null --max-time 15 "$server/login" || die "can't reach $server (network, DNS, or the address)"
+    ok "Debian ${VERSION_ID:-?} amd64, $server reachable"
+fi
+[ -z "$server" ] || remember SETUP_SERVER "$server"
+
+if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != yes ]; then
+    timedatectl set-ntp true || true
+    for _ in $(seq 1 30); do
+        [ "$(timedatectl show -p NTPSynchronized --value)" = yes ] && break
+        sleep 2
+    done
+fi
+if [ "$(timedatectl show -p NTPSynchronized --value)" = yes ]; then
+    ok "clock synchronized"
+else
+    warn "clock not synchronized yet: certificates can look invalid until it is"
+fi
+
+# The name: --hostname, else the one a first run picked, else one from the code.
+if [ -z "$hostname" ]; then
+    hostname="$SETUP_HOSTNAME"
+fi
+if [ -z "$hostname" ] && [ -n "$code" ]; then
+    hostname="arena-$(printf '%s' "$code" | tr -cd 'A-Za-z0-9' | cut -c1-4 | tr '[:upper:]' '[:lower:]')"
+fi
+hostname="${hostname:-$(hostnamectl --static)}"
+
+# --- 2. security updates ----------------------------------------------------------------
+step "2/9 Security updates"
+# A set-up PC gets them from unattended-upgrades in quiet hours; upgrading here could swap the
+# browser under a live screen.
+if [ -z "$upgrade" ]; then
+    if [ -n "$SETUP_DONE" ]; then upgrade=0; else upgrade=1; fi
+fi
+if [ "$upgrade" -eq 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 upgrade -y -qq
+    ok "up to date"
+elif [ -n "$SETUP_DONE" ]; then
+    ok "left to automatic updates (already set up; --upgrade to install now)"
+else
+    warn "skipped (--no-upgrade)"
+fi
+
+# --- 3. the agent ---------------------------------------------------------------------
+step "3/9 Install the agent (verifies the release, then provision.sh: packages, kiosk, lockdown)"
+version="$("$here/cms-arena-agent" version)"
+installed=""
+[ -x "$AGENT_ROOT/current/cms-arena-agent" ] && installed="$("$AGENT_ROOT/current/cms-arena-agent" version)"
+if [ -z "$installed" ]; then
+    "$here/cms-arena-agent" apply --dir "$here" --root "$AGENT_ROOT"
+    ok "agent $version installed in $AGENT_ROOT"
+else
+    # Installed already (updates come from the CMS rollout, never from this script): re-run the
+    # installed release's provision.sh, which only fixes what's missing or changed.
+    release="$(readlink -f "$AGENT_ROOT/current")"
+    CMS_ARENA_RELEASE_DIR="$release" "$release/provision.sh"
+    if [ "$installed" = "$version" ]; then
+        ok "agent $installed already installed, its setup checked"
+    else
+        ok "agent $installed installed (this release is $version; the CMS rollout updates it), its setup checked"
+    fi
+fi
+agent="$AGENT_ROOT/current/cms-arena-agent"
+
+# --- 4. name ------------------------------------------------------------------------------
+step "4/9 Name this PC"
+if [ "$(hostnamectl --static)" != "$hostname" ]; then
+    hostnamectl set-hostname "$hostname"
+    ok "named $hostname"
+else
+    ok "$hostname"
+fi
+# Debian resolves its own name through /etc/hosts (127.0.1.1); without it sudo complains.
+if grep -q '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
+    grep -qE "^127\.0\.1\.1[[:space:]]+$hostname\$" /etc/hosts || sed -i "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1\t$hostname/" /etc/hosts
+else
+    printf '127.0.1.1\t%s\n' "$hostname" >>/etc/hosts
+fi
+remember SETUP_HOSTNAME "$hostname"
+
+# --- 5. Tailscale ---------------------------------------------------------------------------
+step "5/9 Tailscale (remote support)"
+if [ "$tailscale" -eq 0 ]; then
+    warn "skipped (--no-tailscale)"
+elif command -v tailscale >/dev/null && tailscale status >/dev/null 2>&1; then
+    ts_name="$(tailscale status --json 2>/dev/null | sed -n '/"Self"/,/}/s/.*"HostName": *"\([^"]*\)".*/\1/p' | head -n1)"
+    if [ -n "$ts_name" ] && [ "$ts_name" != "$hostname" ]; then
+        tailscale set --hostname="$hostname"
+        ok "on the tailnet, renamed $ts_name → $hostname"
+    else
+        ok "already on the tailnet as $hostname"
+    fi
+else
+    command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+    echo "   Open the link below on your phone and approve this PC:"
+    tailscale up --ssh --accept-dns=false --advertise-tags=tag:arena-display --hostname="$hostname"
+    ok "joined the tailnet as $hostname"
+fi
+
+# --- 6. enroll --------------------------------------------------------------------------------
+step "6/9 Enroll with the CMS"
+enrolled_now=""
+if enrolled; then
+    cert_key="$(openssl x509 -in "$CONFIG_DIR/device.crt" -noout -pubkey 2>/dev/null || true)"
+    key_pub="$(openssl pkey -in "$CONFIG_DIR/device.key" -pubout 2>/dev/null || true)"
+    [ -n "$cert_key" ] && [ "$cert_key" = "$key_pub" ] ||
+        die "$CONFIG_DIR/device.crt doesn't match device.key: revoke this PC in the CMS, issue a new code, run: $agent enroll --force --server <cms> --code <code>"
+    ok "already enrolled (to enroll again: revoke in the CMS, issue a new code, run $agent enroll --force …)"
+else
+    if [ -f "$CONFIG_DIR/enroll-pending.json" ]; then
+        echo "   An earlier run started enrolling: picking it up (the code isn't needed again)."
+    fi
+    echo "   Compare the fingerprint below with the device's card in the CMS, then click Approve there."
+    # Also puts the certificate into the kiosk browser (cms-arena-kiosk-cert).
+    "$agent" enroll --server "$server" ${code:+--code "$code"} --dir "$CONFIG_DIR" --root "$AGENT_ROOT"
+    enrolled_now=1
+    ok "enrolled"
+fi
+
+# --- 7. start --------------------------------------------------------------------------------
+step "7/9 Certificate into the kiosk browser, start the agent"
+# Changes nothing (and restarts nothing) when the browser already has this certificate.
+/usr/local/bin/cms-arena-kiosk-cert
+if [ -n "$enrolled_now" ] || ! systemctl is-active --quiet cms-arena-agent.service; then
+    # Before enrollment the agent had no config and systemd gave up on it; clear that.
+    systemctl reset-failed cms-arena-agent.service 2>/dev/null || true
+    systemctl restart cms-arena-agent.service
+    sleep 5
+    ok "agent started"
+else
+    ok "agent already running"
+fi
+
+# --- 8. verify ----------------------------------------------------------------------------------
+step "8/9 Check"
+display_url="$(sed -n 's/^[[:space:]]*"cms_url":[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG_DIR/config.json")"
+status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+    --cert "$CONFIG_DIR/device.crt" --key "$CONFIG_DIR/device.key" "$display_url/device-api/v1/state" || true)"
+case "$status" in
+    200) ok "the display host accepts this PC's certificate ($display_url)" ;;
+    403) warn "the display host refused this PC (403): an IP restriction on its tag, or revoked" ;;
+    423) warn "the device is halted in the CMS: Resume it" ;;
+    *) warn "the display host answered $status" ;;
+esac
+healthy=1
+if systemctl is-active --quiet cms-arena-agent.service; then ok "agent running"; else healthy=""; warn "agent not running: journalctl -u cms-arena-agent"; fi
+
+# --- 9. lock the install login, start the screen -------------------------------------------------
+step "9/9 Lock the install login, start the screen"
+# A PC installed from the install USB has a login with a throwaway password that is public (it's in
+# the cms-agent repo). Once Tailscale works, that password is locked: remote support goes through
+# Tailscale SSH (the tailnet checks who you are), with sudo without a password for that user.
+INSTALL_USER_FILE="$CONFIG_DIR/install-user"
+if [ -f "$INSTALL_USER_FILE" ]; then
+    install_user="$(cat "$INSTALL_USER_FILE")"
+    if ! id "$install_user" >/dev/null 2>&1; then
+        rm -f "$INSTALL_USER_FILE"
+    elif [ "$tailscale" -eq 1 ] && tailscale status >/dev/null 2>&1; then
+        sudoers=/etc/sudoers.d/cms-arena-admin
+        printf '# cms-pc-setup: the install login is password-locked; reached over Tailscale SSH only.\n%s ALL=(ALL) NOPASSWD: ALL\n' \
+            "$install_user" >"$sudoers.new"
+        chmod 0440 "$sudoers.new"
+        visudo -cqf "$sudoers.new" || { rm -f "$sudoers.new"; die "sudoers check failed: install password left as is"; }
+        mv "$sudoers.new" "$sudoers"
+        passwd -lq "$install_user"
+        rm -f "$INSTALL_USER_FILE"
+        ok "install password of $install_user locked; log in with: tailscale ssh $install_user@$hostname"
+    else
+        warn "the install password of $install_user is still set (Tailscale isn't up): it gets locked when this runs with Tailscale working"
+    fi
+else
+    ok "no install login to lock"
+fi
+
+current_step=""
+if [ -z "$SETUP_DONE" ] && [ -n "$healthy" ] && [ "$status" = 200 ]; then
+    remember SETUP_DONE "$(date '+%Y-%m-%d %H:%M')"
+    # The install USB's "not set up yet" console text.
+    printf 'CMS arena display PC %s (\\l), set up %s\n\n' "$hostname" "$(date '+%Y-%m-%d')" >/etc/issue
+    printf '\n  CMS arena display PC, set up %s. Running sudo cms-pc-setup again only checks and repairs.\n\n' \
+        "$(date '+%Y-%m-%d')" >/etc/motd
+fi
+
+# The kiosk only gets switched on here, after enrollment: before that, tty1 stays a normal login
+# for running this script. Starting it takes over tty1, which ends a session running this on
+# that console, so it comes last.
+systemctl enable --quiet cms-arena-kiosk.service
+if systemctl is-active --quiet cms-arena-kiosk.service; then
+    ok "screen already running"
+    [ -z "$SETUP_DONE" ] || { echo; echo "Checked: nothing else to do."; exit 0; }
+fi
+cat <<DONE
+
+Done. In the CMS: drag this PC onto its site's tag and set its layout (click the screen drawing).
+Then lock the BIOS: boot from the SSD only, USB boot off, supervisor password. Unplug the keyboard.
+DONE
+if ! systemctl is-active --quiet cms-arena-kiosk.service; then
+    echo
+    echo "Starting the screen in 10 seconds: this console switches to the display (Ctrl-C to stay here and start it later with: sudo systemctl start cms-arena-kiosk)."
+    sleep 10
+    systemctl reset-failed cms-arena-kiosk.service 2>/dev/null || true
+    systemctl start --no-block cms-arena-kiosk.service
+fi

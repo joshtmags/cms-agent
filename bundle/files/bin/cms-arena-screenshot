@@ -4,4 +4,8 @@
 set -eu
 out="${1:?usage: cms-arena-screenshot FILE.png}"
 uid="$(id -u kiosk)"
-XDG_RUNTIME_DIR="/run/user/$uid" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" grim "$out"
+runtime="/run/user/$uid"
+# cage names its socket wayland-0 or wayland-1; take whichever exists.
+socket="$(find "$runtime" -maxdepth 1 -name 'wayland-*' ! -name '*.lock' 2>/dev/null | head -n 1)"
+[ -n "$socket" ] || { echo "no Wayland session for kiosk: is cms-arena-kiosk running?" >&2; exit 1; }
+XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="$(basename "$socket")" grim "$out"
