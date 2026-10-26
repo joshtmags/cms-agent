@@ -16,8 +16,15 @@ stage="$out/stage"
 rm -rf "$out"
 mkdir -p "$stage"
 
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
-	-ldflags "-s -w -X github.com/joshtmags/cms-agent/internal/version.Version=$version" \
+# Display PCs are linux/amd64. scripts/local-test.sh overrides GOOS/GOARCH to
+# run the agent on a Mac, and passes CMS_AGENT_LOCAL_TEST_KEY; CI sets neither.
+ldflags="-s -w -X github.com/joshtmags/cms-agent/internal/version.Version=$version"
+if [ -n "${CMS_AGENT_LOCAL_TEST_KEY:-}" ]; then
+	echo "WARNING: building with a LOCAL TEST signing key (not for release)" >&2
+	ldflags="$ldflags -X 'github.com/joshtmags/cms-agent/keys.localTestKey=$CMS_AGENT_LOCAL_TEST_KEY'"
+fi
+GOOS="${GOOS:-linux}" GOARCH="${GOARCH:-amd64}" CGO_ENABLED=0 go build -trimpath \
+	-ldflags "$ldflags" \
 	-o "$stage/cms-arena-agent" ./cmd/cms-arena-agent
 
 cp bundle/provision.sh "$stage/provision.sh"
