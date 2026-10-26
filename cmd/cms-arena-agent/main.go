@@ -1,5 +1,6 @@
 // Command cms-arena-agent runs on each arena display PC.
 //
+//	cms-arena-agent enroll --server URL --code XXXX-XXXX   get this PC's certificate (once, at setup)
 //	cms-arena-agent run                      poll the CMS, report status, pull signed updates (systemd)
 //	cms-arena-agent version                  print the version
 //	cms-arena-agent verify --dir DIR         verify a downloaded release exactly as a PC would
@@ -17,11 +18,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/joshtmags/cms-agent/internal/agent"
 	"github.com/joshtmags/cms-agent/internal/bundle"
+	"github.com/joshtmags/cms-agent/internal/enroll"
 	"github.com/joshtmags/cms-agent/internal/install"
 	"github.com/joshtmags/cms-agent/internal/minisign"
 	"github.com/joshtmags/cms-agent/internal/version"
@@ -38,6 +41,8 @@ func main() {
 
 	var err error
 	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
+	case "enroll":
+		err = enrollCmd(ctx, args)
 	case "run":
 		err = run(ctx, args)
 	case "version":
@@ -59,8 +64,21 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cms-arena-agent run|version|verify|apply|healthcheck|rollback [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cms-arena-agent enroll|run|version|verify|apply|healthcheck|rollback [flags]")
 	os.Exit(2)
+}
+
+func enrollCmd(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	server := fs.String("server", "", "the CMS, e.g. https://cms.example.com (the normal host, not the display host)")
+	code := fs.String("code", "", "one-time enrollment code from the CMS")
+	dir := fs.String("dir", filepath.Dir(agent.DefaultConfigPath), "where the key, certificate and config go")
+	root := fs.String("root", install.DefaultRoot, "install root written into config.json")
+	fs.Parse(args)
+	if *server == "" || *code == "" {
+		return errors.New("--server and --code are required")
+	}
+	return enroll.Run(ctx, enroll.Options{Server: *server, Code: *code, Dir: *dir, Root: *root, Out: os.Stdout})
 }
 
 func run(ctx context.Context, args []string) error {
@@ -75,6 +93,9 @@ func run(ctx context.Context, args []string) error {
 	key, err := keys.UpdateKey()
 	if err != nil {
 		return fmt.Errorf("no valid update-signing key built in: %w", err)
+	}
+	if keys.UsingLocalTestKey() {
+		log.Print("WARNING: this build trusts a LOCAL TEST signing key")
 	}
 	a, err := agent.New(cfg, key)
 	if err != nil {
@@ -194,5 +215,9 @@ func rollback(ctx context.Context, args []string) error {
 }
 
 func restartAgent() error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		log.Print("no systemd here; restart the agent yourself")
+		return nil
+	}
 	return exec.Command("systemctl", "restart", "--no-block", "cms-arena-agent.service").Run()
 }

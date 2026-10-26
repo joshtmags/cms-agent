@@ -4,7 +4,7 @@ The agent (`cms-arena-agent`) that runs on each arena display PC (Intel N150, De
 
 The full design (certificates, display page, stream lock-down, power, install USB) lives in the cms repo: `docs/arena-display-devices.md`. This repo implements its device side.
 
-**Status:** the signed update pipeline is done and tested: build, sign, verify, install, health check, rollback. Still to come: enrollment with the TPM key (`cms-arena-setup`), the kiosk and splash page in `provision.sh`, display commands (reload/reboot/shutdown/screenshot), and the install USB build. These need the Phase 0 hardware.
+**Status:** done and tested end to end against the local CMS: enrollment (one-time code, key generated on the PC, CMS-signed certificate, revoke and re-enroll) and the signed update pipeline (build, sign, verify, install, health check, rollback). Still to come: the TPM-held key and `cms-arena-setup`, the kiosk and splash page in `provision.sh`, display commands (reload/reboot/shutdown/screenshot), and the install USB build. These need the Phase 0 hardware.
 
 ## How an update gets from your Mac to every PC
 
@@ -89,6 +89,24 @@ minisign -S -s /tmp/t.key -m dist/0.1.0/manifest.json -t "cms-arena-agent 0.1.0"
 go run ./cmd/cms-arena-agent verify --dir dist/0.1.0 --pubkey /tmp/t.pub
 ```
 
+## Test everything on your Mac against the local CMS (Herd)
+
+`scripts/local-test.sh` runs the real agent on the Mac against `cms.test`: mTLS through Herd's nginx, signed releases, self-update, rejection and rollback. It uses throwaway keys in `.local-test/` (git-ignored). Builds made this way trust the test key and print a warning; release builds never do.
+
+```sh
+scripts/local-test.sh setup                 # test signing key and test device CA; prints the cms .env lines
+scripts/local-test.sh herd                  # adds display.cms.test (mTLS) to Herd and restarts it
+# cms: php artisan migrate && php artisan display:device-new "Local test PC" --test-unit   (prints a code)
+scripts/local-test.sh enroll XXXX-XXXX      # shows the key fingerprint and waits;
+# cms: php artisan display:device-approve "Local test PC"   (after comparing the fingerprint)
+scripts/local-test.sh release 0.1.0         # then in cms: php artisan display:release-import <dir>; display:release-rollout 0.1.0 all
+scripts/local-test.sh install 0.1.0
+scripts/local-test.sh run                   # leave running; roll out newer releases in the CMS and watch
+scripts/local-test.sh tamper 0.4.1          # a signed release corrupted afterwards: the CMS refuses it on import
+```
+
+`php artisan display:devices` in the cms shows what each PC runs, what it should run, and the last update result. To undo the Herd change, delete `~/Library/Application Support/Herd/config/valet/Nginx/display.cms.test` and run `herd restart`.
+
 ## On the PC
 
 | Path | What |
@@ -106,7 +124,7 @@ Commands (over Tailscale SSH): `cms-arena-agent version`, `verify --dir`, `apply
 Documented in full in the cms repo's plan. The agent uses:
 
 - `GET /device-api/v1/state` → `{"agent": {"desired_version": "1.1.0", "bundle_url": "https://display.<cms-domain>/device-api/v1/bundles/1.1.0", "safe_to_update": true}}`
-- `POST /device-api/v1/heartbeat` ← `{"agent_version", "hostname", "uptime_seconds", "pending_update", "failed_versions", "last_update": {"version", "status": "waiting|rejected|failed|installed", "error", "at"}}`
+- `POST /device-api/v1/heartbeat` ← `{"agent_version", "hostname", "uptime_seconds", "pending_update", "failed_versions", "last_update": {"version", "status": "waiting|rejected|failed|installed|healthy|rolled_back", "error", "at"}}`
 - `GET {bundle_url}/manifest.json`, `/manifest.json.minisig`, `/cms-arena-agent-<v>.tar.gz` (must be on the display host)
 
 ## Layout

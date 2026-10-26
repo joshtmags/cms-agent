@@ -4,11 +4,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/joshtmags/cms-agent/internal/bundle"
@@ -20,6 +23,11 @@ import (
 // ErrRestart means a new version was installed: the process should exit so
 // systemd starts the new binary.
 var ErrRestart = errors.New("new version installed, restarting")
+
+// retryAfter is how long a version that was rejected or failed to install is
+// left alone before trying again, so a bad release isn't re-downloaded on
+// every poll.
+const retryAfter = 10 * time.Minute
 
 // Agent runs the poll loop.
 type Agent struct {
@@ -37,13 +45,15 @@ func New(cfg *Config, updateKey minisign.PublicKey) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{
+	a := &Agent{
 		cfg:       cfg,
 		client:    client,
 		layout:    install.Layout{Root: cfg.Root},
 		updateKey: updateKey,
 		started:   time.Now(),
-	}, nil
+	}
+	a.last = a.loadLastUpdate()
+	return a, nil
 }
 
 // Run polls until ctx is cancelled or a new version is installed.
@@ -68,14 +78,85 @@ func (a *Agent) tick(ctx context.Context) error {
 		return nil
 	}
 	// Reaching the CMS with our certificate is the proof that a fresh update works.
+	pending, _ := a.layout.Pending()
 	if err := a.layout.MarkHealthy(version.Version); err != nil {
 		log.Printf("mark healthy: %v", err)
+	} else if pending != nil && pending.Version == version.Version {
+		a.record(version.Version, "healthy", nil)
+	}
+	for _, cmd := range st.Commands {
+		a.runCommand(ctx, cmd)
 	}
 	updateErr := a.maybeUpdate(ctx, st.Agent)
 	if err := a.client.SendHeartbeat(ctx, a.heartbeat()); err != nil {
 		log.Printf("heartbeat: %v", err)
 	}
 	return updateErr
+}
+
+// runCommand does what the admin asked and reports it. Reboot and shutdown report first:
+// afterwards there is no agent left to report anything.
+func (a *Agent) runCommand(ctx context.Context, cmd Command) {
+	argv := a.cfg.command(cmd.Type)
+	if len(argv) == 0 {
+		a.report(ctx, cmd, fmt.Errorf("unknown command %q", cmd.Type))
+		return
+	}
+	log.Printf("command %d: %s", cmd.ID, cmd.Type)
+
+	switch cmd.Type {
+	case "reboot", "shutdown":
+		a.report(ctx, cmd, nil)
+		if err := a.exec(ctx, argv); err != nil {
+			a.report(ctx, cmd, err)
+		}
+	case "screenshot":
+		dir, err := os.MkdirTemp("", "cms-arena-screenshot-")
+		if err != nil {
+			a.report(ctx, cmd, err)
+			return
+		}
+		defer os.RemoveAll(dir)
+		png := filepath.Join(dir, "screen.png")
+		if err := a.exec(ctx, withFile(argv, png)); err != nil {
+			a.report(ctx, cmd, err)
+			return
+		}
+		if err := a.client.UploadScreenshot(ctx, cmd.ID, png); err != nil {
+			a.report(ctx, cmd, fmt.Errorf("upload: %w", err))
+		}
+	default:
+		a.report(ctx, cmd, a.exec(ctx, argv))
+	}
+}
+
+func (a *Agent) report(ctx context.Context, cmd Command, err error) {
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+		log.Printf("command %d %s failed: %v", cmd.ID, cmd.Type, err)
+	}
+	if rerr := a.client.ReportCommand(ctx, cmd.ID, err == nil, errText); rerr != nil {
+		log.Printf("command %d report: %v", cmd.ID, rerr)
+	}
+}
+
+func (a *Agent) exec(ctx context.Context, argv []string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func withFile(argv []string, file string) []string {
+	out := make([]string, len(argv))
+	for i, arg := range argv {
+		out[i] = strings.ReplaceAll(arg, "{file}", file)
+	}
+	return out
 }
 
 func (a *Agent) heartbeat() Heartbeat {
@@ -104,6 +185,26 @@ func (a *Agent) record(v, status string, err error) {
 		log.Printf("update %s %s", v, status)
 	}
 	a.last = r
+	// Kept on disk so the result survives the restart that follows an install.
+	if data, err := json.Marshal(r); err == nil {
+		os.WriteFile(a.lastUpdatePath(), data, 0o644)
+	}
+}
+
+func (a *Agent) lastUpdatePath() string {
+	return filepath.Join(a.cfg.Root, "state", "last-update.json")
+}
+
+func (a *Agent) loadLastUpdate() *UpdateResult {
+	data, err := os.ReadFile(a.lastUpdatePath())
+	if err != nil {
+		return nil
+	}
+	var r UpdateResult
+	if json.Unmarshal(data, &r) != nil {
+		return nil
+	}
+	return &r
 }
 
 func (a *Agent) maybeUpdate(ctx context.Context, want AgentState) error {
@@ -114,11 +215,15 @@ func (a *Agent) maybeUpdate(ctx context.Context, want AgentState) error {
 	if failed, err := a.layout.FailedVersions(); err == nil {
 		if reason, ok := failed[v]; ok {
 			// A rolled-back version is never retried automatically; publish a newer one.
-			if a.last == nil || a.last.Version != v {
-				a.record(v, "rejected", fmt.Errorf("was rolled back before: %s", reason))
+			if a.last == nil || a.last.Version != v || a.last.Status != "rolled_back" {
+				a.record(v, "rolled_back", errors.New(reason))
 			}
 			return nil
 		}
+	}
+	if a.last != nil && a.last.Version == v && (a.last.Status == "rejected" || a.last.Status == "failed") &&
+		time.Since(a.last.At) < retryAfter {
+		return nil
 	}
 	if !want.SafeToUpdate {
 		if a.last == nil || a.last.Version != v || a.last.Status != "waiting" {

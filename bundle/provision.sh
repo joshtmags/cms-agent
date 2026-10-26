@@ -27,6 +27,8 @@ install_file() {
 }
 
 # --- systemd units for the agent itself ---------------------------------------
+# Skipped where there is no systemd (the Mac in scripts/local-test.sh, containers).
+if command -v systemctl >/dev/null 2>&1; then
 units_changed=""
 for unit in cms-arena-agent.service cms-arena-agent-rollback.service \
 	cms-arena-agent-healthcheck.service cms-arena-agent-healthcheck.timer; do
@@ -40,6 +42,14 @@ if [ -n "$units_changed" ]; then
 fi
 systemctl enable --quiet cms-arena-agent.service cms-arena-agent-healthcheck.timer
 systemctl start --quiet cms-arena-agent-healthcheck.timer
+else
+	log "no systemd here, skipping units"
+fi
+
+# --- helpers the agent's commands call ------------------------------------------
+if [ -n "$(install_file "$files/bin/cms-arena-screenshot" /usr/local/bin/cms-arena-screenshot 0755)" ]; then
+	log "updated cms-arena-screenshot"
+fi
 
 # --- packages ------------------------------------------------------------------
 # Packages the display needs that weren't on the install USB yet. Installing a

@@ -26,6 +26,25 @@ type Config struct {
 	PollIntervalSeconds int    `json:"poll_interval_seconds,omitempty"`
 	HealthWindowSeconds int    `json:"health_window_seconds,omitempty"`
 	Root                string `json:"root,omitempty"`
+
+	// Commands maps an admin command to the program it runs; "{file}" in a screenshot command
+	// is replaced with the PNG path to write. Missing entries use DefaultCommands.
+	Commands map[string][]string `json:"commands,omitempty"`
+}
+
+// DefaultCommands are what the commands do on a display PC (Debian, systemd, cage + Chromium).
+var DefaultCommands = map[string][]string{
+	"restart_browser": {"systemctl", "restart", "cms-arena-kiosk.service"},
+	"reboot":          {"systemctl", "reboot"},
+	"shutdown":        {"systemctl", "poweroff"},
+	"screenshot":      {"/usr/local/bin/cms-arena-screenshot", "{file}"},
+}
+
+func (c *Config) command(name string) []string {
+	if cmd, ok := c.Commands[name]; ok && len(cmd) > 0 {
+		return cmd
+	}
+	return DefaultCommands[name]
 }
 
 // LoadConfig reads and validates the config file, filling in defaults.

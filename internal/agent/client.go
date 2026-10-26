@@ -5,18 +5,29 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-// State is the CMS's answer to GET /device-api/v1/state (the part the agent
-// uses so far; display layout goes to the page, not the agent).
+// State is the CMS's answer to GET /device-api/v1/state (display layout goes
+// to the page, not the agent).
 type State struct {
-	Agent AgentState `json:"agent"`
+	Agent    AgentState `json:"agent"`
+	Commands []Command  `json:"commands"`
+}
+
+// Command is something the admin asked for: restart_browser, reboot,
+// shutdown or screenshot. Each is handed out once and reported back.
+type Command struct {
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
 }
 
 // AgentState tells the agent which version it should run.
@@ -42,7 +53,7 @@ type Heartbeat struct {
 // UpdateResult reports the outcome of the most recent update attempt.
 type UpdateResult struct {
 	Version string    `json:"version"`
-	Status  string    `json:"status"` // waiting, rejected, failed, installed
+	Status  string    `json:"status"` // waiting, rejected, failed, installed, healthy, rolled_back
 	Error   string    `json:"error,omitempty"`
 	At      time.Time `json:"at"`
 }
@@ -53,23 +64,50 @@ type Client struct {
 	http *http.Client
 }
 
-// NewClient loads the device certificate and builds an mTLS client. The
-// server is verified against the system roots (the display host has a public
+// NewClient builds an mTLS client with the device certificate. The server is
+// verified against the system roots (the display host has a public
 // certificate).
 func NewClient(c *Config) (*Client, error) {
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-	if err != nil {
+	certs := &certFiles{cert: c.CertFile, key: c.KeyFile}
+	if _, err := certs.get(nil); err != nil {
 		return nil, fmt.Errorf("device certificate: %w", err)
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		GetClientCertificate: certs.get,
+		MinVersion:           tls.VersionTLS12,
 	}
 	return &Client{
 		base: strings.TrimRight(c.CMSURL, "/"),
 		http: &http.Client{Transport: transport, Timeout: 30 * time.Second},
 	}, nil
+}
+
+// certFiles reloads the certificate whenever the files change, so a renewed
+// or re-enrolled certificate is used without restarting the agent.
+type certFiles struct {
+	cert, key string
+	mu        sync.Mutex
+	loaded    *tls.Certificate
+	modTime   time.Time
+}
+
+func (c *certFiles) get(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	info, err := os.Stat(c.cert)
+	if err != nil {
+		return nil, err
+	}
+	if c.loaded != nil && info.ModTime().Equal(c.modTime) {
+		return c.loaded, nil
+	}
+	cert, err := tls.LoadX509KeyPair(c.cert, c.key)
+	if err != nil {
+		return nil, err
+	}
+	c.loaded, c.modTime = &cert, info.ModTime()
+	return c.loaded, nil
 }
 
 // State fetches the desired state.
@@ -83,12 +121,16 @@ func (c *Client) State(ctx context.Context) (*State, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusLocked {
+		// Halted in the CMS: same certificate, so polling on picks up again on Resume.
+		return nil, errors.New("halted by the administrator (HTTP 423); waiting for Resume")
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("state: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	var st State
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&st); err != nil {
-		return nil, fmt.Errorf("state: %w", err)
+		return nil, fmt.Errorf("decoding: %w", err)
 	}
 	return &st, nil
 }
@@ -110,7 +152,63 @@ func (c *Client) SendHeartbeat(ctx context.Context, hb Heartbeat) error {
 	}
 	resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("heartbeat: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ReportCommand tells the CMS how a command went.
+func (c *Client) ReportCommand(ctx context.Context, id int64, ok bool, errText string) error {
+	body, err := json.Marshal(map[string]any{"ok": ok, "error": errText})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/device-api/v1/commands/%d/result", c.base, id), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	return c.expectNoContent(req)
+}
+
+// UploadScreenshot sends a PNG for a screenshot command.
+func (c *Client) UploadScreenshot(ctx context.Context, id int64, pngPath string) error {
+	f, err := os.Open(pngPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var buf bytes.Buffer
+	form := multipart.NewWriter(&buf)
+	part, err := form.CreateFormFile("screenshot", "screenshot.png")
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, io.LimitReader(f, 8<<20)); err != nil {
+		return err
+	}
+	if err := form.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/device-api/v1/commands/%d/screenshot", c.base, id), &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+	return c.expectNoContent(req)
+}
+
+func (c *Client) expectNoContent(req *http.Request) error {
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	return nil
 }

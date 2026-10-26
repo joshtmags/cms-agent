@@ -1,0 +1,7 @@
+#!/bin/sh
+# The admin's "Take screenshot": captures the kiosk's screen (cage on Wayland, run by the
+# kiosk user) into the PNG path given. Called by the agent as root.
+set -eu
+out="${1:?usage: cms-arena-screenshot FILE.png}"
+uid="$(id -u kiosk)"
+XDG_RUNTIME_DIR="/run/user/$uid" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" grim "$out"
