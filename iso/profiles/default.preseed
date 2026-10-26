@@ -1,0 +1,79 @@
+# Answers for the Debian installer on the install USB (iso/build-iso.sh fills in @PASSWORD_HASH@).
+# Every question is answered except one, on purpose: "Write the changes to disks?" (partman/confirm),
+# asked when the disk already has partitions, naming the disk about to be erased. So a set-up PC that
+# boots from a forgotten stick never wipes itself. A blank disk isn't asked (confirm_nooverwrite).
+# Reference: https://www.debian.org/releases/stable/example-preseed.txt
+
+# simple-cdd needs this (it loads the arena profile: its packages)
+d-i preseed/early_command string anna-install simple-cdd-profiles
+simple-cdd simple-cdd/profiles multiselect arena
+
+# --- language, keyboard, time ---------------------------------------------------------------
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i clock-setup/utc boolean true
+d-i time/zone string Asia/Manila
+# set later by systemd-timesyncd, once there's a network
+d-i clock-setup/ntp boolean false
+
+# --- network: wired DHCP, and carry on without one (everything is on the stick) -----------------
+d-i netcfg/choose_interface select auto
+d-i netcfg/hostname string arena-new
+d-i netcfg/get_hostname string arena-new
+d-i netcfg/get_domain string
+d-i netcfg/dhcp_failed note
+d-i netcfg/dhcp_options select Do not configure the network at this time
+d-i netcfg/wireless_wep string
+d-i hw-detect/load_firmware boolean true
+
+# --- packages only from the stick; late-command.sh writes the online sources for updates -------------
+d-i apt-setup/use_mirror boolean false
+d-i apt-setup/no_mirror boolean true
+d-i apt-setup/cdrom/set-first boolean false
+d-i apt-setup/cdrom/set-next boolean false
+d-i apt-setup/cdrom/set-failed boolean false
+d-i apt-setup/non-free-firmware boolean true
+d-i apt-setup/services-select multiselect
+d-i apt-setup/disable-cdrom-entries boolean true
+
+# --- accounts: no root login; one admin with a throwaway password (cms-pc-setup locks it) -------------
+d-i passwd/root-login boolean false
+d-i passwd/user-fullname string Arena setup
+d-i passwd/username string arena
+d-i passwd/user-password-crypted password @PASSWORD_HASH@
+
+# --- disk: the internal one (pick-disk.sh never picks the USB stick), one partition, no encryption ---------
+# Disk encryption comes with the TPM unlock (stage 6): without it every power-on would ask for a passphrase.
+d-i partman/early_command string sh /cdrom/simple-cdd/pick-disk.sh
+d-i partman-auto/method string regular
+d-i partman-auto/choose_recipe select atomic
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm_nooverwrite boolean true
+d-i partman-efi/non_efi_system boolean true
+# NOT answered: d-i partman/confirm (the one confirmation, see the top)
+
+# --- software: no tasks (no desktop); the arena profile's packages, without recommends ------------
+tasksel tasksel/first multiselect
+d-i base-installer/install-recommends boolean false
+d-i pkgsel/upgrade select none
+d-i pkgsel/update-policy select none
+popularity-contest popularity-contest/participate boolean false
+iperf3 iperf3/start_daemon boolean false
+console-common console-data/keymap/policy select Don't touch keymap
+console-data console-data/keymap/policy select Don't touch keymap
+
+# --- boot loader: also in the fallback EFI path, so it boots even if the firmware drops its entry ---------
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/with_other_os boolean false
+d-i grub-installer/bootdev string default
+d-i grub-installer/force-efi-extra-removable boolean true
+
+# --- finish: the agent and its setup from the stick, then power off (take the stick out) ------------------
+d-i preseed/late_command string sh /cdrom/simple-cdd/late-command.sh
+d-i finish-install/reboot_in_progress note
+d-i debian-installer/exit/poweroff boolean true

@@ -6,6 +6,7 @@ Read these before building, releasing, signing, rolling out, or setting up a PC:
 
 @docs/RELEASING.md
 @docs/PC-SETUP.md
+@docs/INSTALL-USB.md
 
 Rules that always apply here:
 

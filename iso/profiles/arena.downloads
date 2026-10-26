@@ -1,0 +1,17 @@
+shim-signed
+grub-efi-amd64-signed
+grub-efi-amd64
+grub-efi-amd64-bin
+grub-pc
+efibootmgr
+linux-image-amd64
+firmware-linux-free
+dosfstools
+tasksel
+tasksel-data
+zstd
+initramfs-tools
+mokutil
+os-prober
+laptop-detect
+pciutils
