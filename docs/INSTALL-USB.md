@@ -20,7 +20,7 @@ iso/build-iso.sh --test-release 1.1.0 --server https://display.cms.test
 - On Apple Silicon the builder runs emulated (linux/amd64): slower, same result.
 - A `-TEST` ISO's agent trusts the throwaway key, so it never accepts a real release from the CMS. Rebuild with `--release` before any real PC.
 
-Tested (2026-10-26) in a UEFI QEMU VM: unattended install from the stick, boot, `cms-pc-setup` (enroll against the local CMS, interrupted and resumed without the code, agent "healthy", kiosk on the screen). **Not yet on real hardware:** Secure Boot, the Intel GPU / video decode, the N150's NIC.
+Tested (2026-10-26/27) in a UEFI QEMU VM, also with the production 1.1.0 stick: unattended install from the stick, boot, `cms-pc-setup` (enroll against the local CMS, interrupted and resumed without the code, agent "healthy"), the kiosk showing `/display` (leaderboard + playing stream, split layout) with the screen's health on the device card, and the Screenshot and Reload screen commands. **Not yet on real hardware:** Secure Boot, the Intel GPU / video decode, the N150's NIC.
 
 What goes in: Debian 13 (trixie) amd64 installer + `bundle/files/packages.txt` from that release (the same list `provision.sh` keeps installed) + Tailscale (from its signed apt repo) + the boot loader for UEFI/Secure Boot + the signed release itself + `iso/cms/*.sh`.
 
